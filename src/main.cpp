@@ -1,5 +1,5 @@
 #include <Wire.h>    //esp32 SDA=21,SCL=22
-#include <BleMouse.h>
+#include <BleCombo.h>
 #include <Arduino.h>
 #include "mouse-control.h"
 
