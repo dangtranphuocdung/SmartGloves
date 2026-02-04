@@ -20,13 +20,22 @@ BleMouse bleMouse;
 double offsetX = 0, offsetY = 0, offsetZ = 0;
 float dpsX, dpsY, dpsZ;
 
-// Độ nhạy (Giữ nguyên 15 như ông chỉnh là ổn)
+// Độ nhạy 
 float x_kand = 0.5;
 float y_kand = 0.4;
 float sc_kand = 0.5; // Tăng lên xíu cho cuộn nhanh hơn
 float offsety = 1.5; // Cái này lát chạy thử nếu trôi lên xuống thì chỉnh lại
 
-int i1 = 0, i2 = 0;
+bool i1 = false;
+bool i2 = false;
+
+bool mouseMovementEnabled = false;
+unsigned long lastReleaseTime = 0;
+int clickCount = 0;
+#define DOUBLE_CLICK_TIME 300
+
+
+//int i1 = 0, i2 = 0;
 
 void calcRotation(){
   int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
