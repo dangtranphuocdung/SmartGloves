@@ -1,10 +1,12 @@
 // ===========================================
 // MOUSE CONTROL MODULE
-// Handles: Mouse movement, button detection, double-click
+// Mouse/keyboard → BLE HID (unchanged)
+// Letter data    → WiFi TCP (replaces Serial + BLE UART)
 // ===========================================
 
 #include "mouse-control.h"
-#include <BleCombo.h> 
+#include "WiFiTcp/wifi-tcp.h"        // ← WiFi TCP replaces bleUartSend
+#include <BleCombo.h>
 #include <Wire.h>
 #include <Arduino.h>
 
@@ -22,139 +24,120 @@
 // ===========================================
 // BUTTON CONFIGURATION
 // ===========================================
-#define ENABLE_BTN 18 
+#define ENABLE_BTN 2
+#define LETTER_BTN 18
 
 // ===========================================
 // SENSOR VARIABLES
 // ===========================================
 double offsetX = 0, offsetY = 0, offsetZ = 0;
 float dpsX, dpsY, dpsZ;
+float accelX, accelY, accelZ;
 
 // ===========================================
-// FILTERING & VARIABLES
+// FILTERING
 // ===========================================
 float ema_alpha = 0.3;
 float ema_x = 0, ema_y = 0, ema_z = 0;
 
 struct KalmanFilter {
-  float Q = 0.001; 
-  float R = 0.03; 
-  float P = 1.0; 
-  float K = 0; 
-  float X = 0;
+  float Q = 0.001, R = 0.03, P = 1.0, K = 0, X = 0;
 };
 KalmanFilter kalman_x, kalman_y, kalman_z;
 
-// Movement Settings
-float DEAD_ZONE = 2.0;
-float ACCEL_THRESHOLD = 25.0;
+float DEAD_ZONE        = 2.0;
+float ACCEL_THRESHOLD  = 25.0;
 float ACCEL_MULTIPLIER = 2.4;
-float x_sensitivity = 0.5;
-float y_sensitivity = 0.4;
+float x_sensitivity    = 0.5;
+float y_sensitivity    = 0.4;
 float adaptive_offset_x = 0, adaptive_offset_y = 0;
 unsigned long last_drift_correction = 0;
 const unsigned long DRIFT_CORRECTION_INTERVAL = 5000;
 
-// Button Struct
+// ===========================================
+// BUTTON
+// ===========================================
 struct Button {
   int pin;
-  bool lastState; 
-  bool currentState;
-  unsigned long lastDebounceTime; 
-  unsigned long debounceDelay;
-  bool isPressed; 
-  unsigned long pressStartTime; 
-  unsigned long releaseTime;
-  unsigned long lastClickTime; 
-  int clickCount; 
-  bool clickProcessed;
-  
+  bool lastState, currentState, isPressed, clickProcessed;
+  unsigned long lastDebounceTime, debounceDelay, pressStartTime, releaseTime, lastClickTime;
+  int clickCount;
+
   Button(int p = 0) {
-    pin = p; 
-    lastState = HIGH; 
-    currentState = HIGH; 
-    lastDebounceTime = 0; 
-    debounceDelay = 50;
-    isPressed = false; 
-    pressStartTime = 0; 
-    releaseTime = 0; 
-    lastClickTime = 0; 
-    clickCount = 0; 
-    clickProcessed = false;
+    pin = p; lastState = HIGH; currentState = HIGH;
+    lastDebounceTime = 0; debounceDelay = 50;
+    isPressed = false; pressStartTime = 0; releaseTime = 0;
+    lastClickTime = 0; clickCount = 0; clickProcessed = false;
   }
 };
 
 Button enableBtn(ENABLE_BTN);
-const unsigned long DOUBLE_CLICK_WINDOW = 400;
+Button letterBtn(LETTER_BTN);
+const unsigned long DOUBLE_CLICK_WINDOW  = 400;
 const unsigned long LONG_PRESS_THRESHOLD = 300;
-const unsigned long CLICK_TIMEOUT = 500;
+const unsigned long CLICK_TIMEOUT        = 500;
 bool movementEnabled = false;
 
 // ===========================================
-// FILTER FUNCTIONS
+// LETTER RECOGNITION
 // ===========================================
-float kalmanUpdate(KalmanFilter &kf, float measurement) {
-  kf.P = kf.P + kf.Q;
-  kf.K = kf.P / (kf.P + kf.R);
-  kf.X = kf.X + kf.K * (measurement - kf.X);
-  kf.P = (1 - kf.K) * kf.P;
+bool          letterModeActive        = false;
+unsigned long letterModeStart         = 0;
+const unsigned long LETTER_RECORDING_DURATION = 2000;  // ms
+
+// ===========================================
+// FILTERS
+// ===========================================
+float kalmanUpdate(KalmanFilter &kf, float m) {
+  kf.P += kf.Q;
+  kf.K  = kf.P / (kf.P + kf.R);
+  kf.X += kf.K * (m - kf.X);
+  kf.P  = (1 - kf.K) * kf.P;
   return kf.X;
 }
-
-float emaFilter(float p, float c, float a) { 
-  return a * c + (1 - a) * p; 
-}
-
-float applyDeadZone(float v, float t) {
-  if (abs(v) < t) return 0;
-  return (v > 0) ? (abs(v) - t) : -(abs(v) - t);
-}
-
-float applyAcceleration(float v, float t, float m) {
-  if (abs(v) > t) return (v > 0) ? (t + (abs(v) - t) * m) : -(t + (abs(v) - t) * m);
-  return v;
-}
+float emaFilter(float p, float c, float a)       { return a*c + (1-a)*p; }
+float applyDeadZone(float v, float t)             { if(abs(v)<t) return 0; return v>0?(abs(v)-t):-(abs(v)-t); }
+float applyAcceleration(float v, float t, float m){ if(abs(v)>t) return v>0?(t+(abs(v)-t)*m):-(t+(abs(v)-t)*m); return v; }
 
 // ===========================================
-// SENSOR FUNCTIONS
+// SENSOR
 // ===========================================
 void calcRotation() {
-  Wire.beginTransmission(MPU6050_ADDR); 
-  Wire.write(0x43); 
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050_ADDR, 6, true);
-  int16_t rx = Wire.read() << 8 | Wire.read();
-  int16_t ry = Wire.read() << 8 | Wire.read();
-  int16_t rz = Wire.read() << 8 | Wire.read();
-  dpsX = ((float)rx) / 65.5; 
-  dpsY = ((float)ry) / 65.5; 
-  dpsZ = ((float)rz) / 65.5;
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x43);
+  Wire.endTransmission(false); Wire.requestFrom(MPU6050_ADDR, 6, true);
+  dpsX = (float)(int16_t)(Wire.read()<<8|Wire.read()) / 65.5f;
+  dpsY = (float)(int16_t)(Wire.read()<<8|Wire.read()) / 65.5f;
+  dpsZ = (float)(int16_t)(Wire.read()<<8|Wire.read()) / 65.5f;
+}
+
+void calcAcceleration() {
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x3B);
+  Wire.endTransmission(false); Wire.requestFrom(MPU6050_ADDR, 6, true);
+  accelX = (float)(int16_t)(Wire.read()<<8|Wire.read()) / 16384.0f;
+  accelY = (float)(int16_t)(Wire.read()<<8|Wire.read()) / 16384.0f;
+  accelZ = (float)(int16_t)(Wire.read()<<8|Wire.read()) / 16384.0f;
 }
 
 void processSensorData(float &fx, float &fy, float &fz) {
   float cx = dpsX - offsetX - adaptive_offset_x;
   float cy = dpsY - offsetY - adaptive_offset_y;
   float cz = dpsZ - offsetZ;
-  
   ema_x = emaFilter(ema_x, cx, ema_alpha);
   ema_y = emaFilter(ema_y, cy, ema_alpha);
   ema_z = emaFilter(ema_z, cz, ema_alpha);
-  
   fx = applyAcceleration(applyDeadZone(kalmanUpdate(kalman_x, ema_x), DEAD_ZONE), ACCEL_THRESHOLD, ACCEL_MULTIPLIER);
   fy = applyAcceleration(applyDeadZone(kalmanUpdate(kalman_y, ema_y), DEAD_ZONE), ACCEL_THRESHOLD, ACCEL_MULTIPLIER);
   fz = applyAcceleration(applyDeadZone(kalmanUpdate(kalman_z, ema_z), DEAD_ZONE), ACCEL_THRESHOLD, ACCEL_MULTIPLIER);
 }
 
 void correctDrift() {
-  unsigned long currentTime = millis();
-  
-  if (!movementEnabled && currentTime - last_drift_correction > DRIFT_CORRECTION_INTERVAL) {
+  unsigned long ct = millis();
+  if (!movementEnabled && ct - last_drift_correction > DRIFT_CORRECTION_INTERVAL) {
     if (abs(ema_x) < 0.5 && abs(ema_y) < 0.5 && abs(ema_z) < 0.5) {
       adaptive_offset_x += ema_x * 0.1;
       adaptive_offset_y += ema_y * 0.1;
-      Serial.println("[Drift] Auto-correction applied");
     }
-    last_drift_correction = currentTime;
+    last_drift_correction = ct;
   }
 }
 
@@ -164,24 +147,16 @@ void correctDrift() {
 void updateButton(Button &btn) {
   int reading = digitalRead(btn.pin);
   unsigned long ct = millis();
-  
   if (reading != btn.lastState) btn.lastDebounceTime = ct;
-  
   if ((ct - btn.lastDebounceTime) > btn.debounceDelay) {
     if (reading != btn.currentState) {
       btn.currentState = reading;
       if (btn.currentState == LOW) {
-        btn.isPressed = true; 
-        btn.pressStartTime = ct;
+        btn.isPressed = true; btn.pressStartTime = ct;
       } else {
-        btn.isPressed = false; 
-        btn.releaseTime = ct;
+        btn.isPressed = false; btn.releaseTime = ct;
         if (btn.releaseTime - btn.pressStartTime < LONG_PRESS_THRESHOLD) {
-          btn.clickCount++; 
-          btn.lastClickTime = ct; 
-          btn.clickProcessed = false;
-          Serial.print("[Button] Click detected! Count: ");
-          Serial.println(btn.clickCount);
+          btn.clickCount++; btn.lastClickTime = ct; btn.clickProcessed = false;
         }
       }
     }
@@ -189,58 +164,80 @@ void updateButton(Button &btn) {
   btn.lastState = reading;
 }
 
-enum ClickType {
-  NO_CLICK,
-  SINGLE_CLICK,
-  DOUBLE_CLICK
-};
-
+enum ClickType { NO_CLICK, SINGLE_CLICK, DOUBLE_CLICK };
 ClickType detectClickType(Button &btn) {
-  unsigned long currentTime = millis();
-  
-  if (btn.clickCount > 0 && (currentTime - btn.lastClickTime) > CLICK_TIMEOUT) {
-    btn.clickCount = 0;
-    btn.clickProcessed = false;
-  }
-  
+  unsigned long ct = millis();
+  if (btn.clickCount > 0 && (ct - btn.lastClickTime) > CLICK_TIMEOUT) { btn.clickCount = 0; btn.clickProcessed = false; }
   if (btn.clickCount > 0 && !btn.clickProcessed) {
-    
-    if (btn.clickCount >= 2) {
-      btn.clickCount = 0;
-      btn.clickProcessed = true;
-      return DOUBLE_CLICK;
-      
-    } else if (btn.clickCount == 1) {
-      if ((currentTime - btn.lastClickTime) > DOUBLE_CLICK_WINDOW) {
-        btn.clickCount = 0;
-        btn.clickProcessed = true;
-        return SINGLE_CLICK;
-      }
-    }
+    if (btn.clickCount >= 2)                                              { btn.clickCount = 0; btn.clickProcessed = true; return DOUBLE_CLICK; }
+    if (btn.clickCount == 1 && (ct - btn.lastClickTime) > DOUBLE_CLICK_WINDOW) { btn.clickCount = 0; btn.clickProcessed = true; return SINGLE_CLICK; }
   }
-  
   return NO_CLICK;
 }
 
 void handleMovementControl() {
   updateButton(enableBtn);
-  
-  bool wasEnabled = movementEnabled;
+  bool was = movementEnabled;
   movementEnabled = enableBtn.isPressed;
-  
-  if (movementEnabled && !wasEnabled) {
-    Serial.println("[Control] Movement ENABLED - Mouse active");
-  } else if (!movementEnabled && wasEnabled) {
-    Serial.println("[Control] Movement DISABLED - Gesture mode active");
-  }
+  if (movementEnabled && !was)  Serial.println("[Control] Mouse ENABLED");
+  if (!movementEnabled && was)  Serial.println("[Control] Mouse DISABLED");
 }
 
 void handleMouseClicks() {
-  ClickType clickType = detectClickType(enableBtn);
-  
-  if (clickType == DOUBLE_CLICK) {
-    Serial.println("[Mouse] DOUBLE-CLICK → Left Mouse Button");
+  if (detectClickType(enableBtn) == DOUBLE_CLICK) {
+    Serial.println("[Mouse] Double-click → LEFT");
     Mouse.click(MOUSE_LEFT);
+  }
+}
+
+// ===========================================
+// LETTER RECOGNITION — data sent over WiFi TCP
+// BLE HID is completely separate and unaffected.
+// ===========================================
+void handleLetterRecognition() {
+  updateButton(letterBtn);
+  unsigned long ct = millis();
+
+  // ── Button pressed → open TCP socket and start recording ─────────────────
+  if (letterBtn.isPressed && !letterModeActive) {
+    if (!wifiIsConnected()) {
+      Serial.println("[Letter] ⚠️  No WiFi — cannot send data. Check hotspot.");
+      return;
+    }
+
+    if (!tcpConnect()) {
+      Serial.println("[Letter] ⚠️  Python server unreachable. Is it running?");
+      return;
+    }
+
+    letterModeActive = true;
+    letterModeStart  = ct;
+
+    tcpSendLn("LETTER_MODE_START");
+    Serial.println("[Letter] Recording started — streaming over WiFi TCP");
+  }
+
+  // ── Recording in progress → stream CSV rows ───────────────────────────────
+  if (letterModeActive) {
+    unsigned long elapsed = ct - letterModeStart;
+
+    if (elapsed < LETTER_RECORDING_DURATION) {
+      calcRotation();
+      calcAcceleration();
+
+      char csv[80];
+      snprintf(csv, sizeof(csv), "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+               accelX, accelY, accelZ, dpsX, dpsY, dpsZ);
+      tcpSendLn(csv);
+
+    } else {
+      // ── Done → send end marker, close socket ─────────────────────────────
+      tcpSendLn("LETTER_MODE_END");
+      tcpDisconnect();
+
+      letterModeActive = false;
+      Serial.println("[Letter] Recording complete — sent to Python.");
+    }
   }
 }
 
@@ -248,163 +245,96 @@ void handleMouseClicks() {
 // MPU6050 HELPERS
 // ===========================================
 void writeMPU6050(byte reg, byte data) {
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(reg);   
-  Wire.write(data);
-  Wire.endTransmission();
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(reg); Wire.write(data); Wire.endTransmission();
 }
-
 byte readMPU6050(byte reg) {
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(true);
-  Wire.requestFrom(MPU6050_ADDR, 1); 
-  return Wire.read();
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(reg); Wire.endTransmission(true);
+  Wire.requestFrom(MPU6050_ADDR, 1); return Wire.read();
 }
 
 // ===========================================
-// PUBLIC FUNCTIONS
+// PUBLIC
 // ===========================================
-
-bool isMovementEnabled() {
-  return movementEnabled;
-}
-
-void getProcessedSensorData(float &fx, float &fy, float &fz) {
-  calcRotation();
-  processSensorData(fx, fy, fz);
-}
-
-float getRawGyroZ() {
-  return dpsZ;
-}
+bool  isMovementEnabled()  { return movementEnabled; }
+bool  isLetterModeActive() { return letterModeActive; }
+float getRawGyroZ()        { return dpsZ; }
+void  getProcessedSensorData(float &fx, float &fy, float &fz) { calcRotation(); processSensorData(fx, fy, fz); }
 
 // ===========================================
 // SETUP
 // ===========================================
 void setupMouse() {
   pinMode(ENABLE_BTN, INPUT_PULLUP);
-  
-  Wire.begin(); 
-  Wire.setClock(400000); 
+  pinMode(LETTER_BTN, INPUT_PULLUP);
+  Wire.begin(); Wire.setClock(400000);
   Serial.begin(115200);
-
   Mouse.begin();
-  
+
   Serial.println("\n╔═══════════════════════════════════════════╗");
   Serial.println("║       Accessibility Glove - Mouse Module  ║");
   Serial.println("╚═══════════════════════════════════════════╝");
-  
+
   delay(100);
-  
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B); 
-  Wire.write(0); 
-  Wire.endTransmission(true);
-  
+  Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
   delay(100);
-  
-  Serial.print("Checking MPU6050... ");
-  if (readMPU6050(MPU6050_WHO_AM_I) != 0x68) {
-    Serial.println("FAILED!");
-    Serial.println("ERROR: MPU6050 not detected!");
-    while (true) delay(1000);
-  }
-  Serial.println("✓ Connected");
+
+  Serial.print("MPU6050... ");
+  if (readMPU6050(MPU6050_WHO_AM_I) != 0x68) { Serial.println("FAILED!"); while(true) delay(1000); }
+  Serial.println("✓");
 
   writeMPU6050(MPU6050_SMPLRT_DIV, 0x00);
-  writeMPU6050(MPU6050_CONFIG, 0x03);
+  writeMPU6050(MPU6050_CONFIG,      0x03);
   writeMPU6050(MPU6050_GYRO_CONFIG, 0x08);
-  writeMPU6050(MPU6050_ACCEL_CONFIG, 0x00);
-  writeMPU6050(MPU6050_PWR_MGMT_1, 0x01);
+  writeMPU6050(MPU6050_ACCEL_CONFIG,0x00);
+  writeMPU6050(MPU6050_PWR_MGMT_1,  0x01);
 
-  Serial.println("\n╔═══════════════════════════════════════════╗");
-  Serial.println("║          CALIBRATION IN PROGRESS          ║");
-  Serial.println("║     Keep your hand COMPLETELY STILL!      ║");
-  Serial.println("╚═══════════════════════════════════════════╝");
-  
+  Serial.println("\n[Calibration] Keep hand STILL...");
   delay(1000);
-  
   for (int i = 0; i < 2000; i++) {
     calcRotation();
-    offsetX += dpsX;
-    offsetY += dpsY;
-    offsetZ += dpsZ;
-    
-    if (i % 200 == 0) {
-      Serial.print("█");
-    }
-    
+    offsetX += dpsX; offsetY += dpsY; offsetZ += dpsZ;
+    if (i % 200 == 0) Serial.print("█");
     delay(2);
   }
   Serial.println(" 100%");
-
-  offsetX /= 2000;
-  offsetY /= 2000;
-  offsetZ /= 2000;
-  
-  Serial.println("\n✓ Calibration Complete!");
-  Serial.print("Offsets → X: "); Serial.print(offsetX, 2);
-  Serial.print(" | Y: "); Serial.print(offsetY, 2);
-  Serial.print(" | Z: "); Serial.println(offsetZ, 2);
+  offsetX /= 2000; offsetY /= 2000; offsetZ /= 2000;
+  Serial.println("✓ Calibration done.");
 }
 
 // ===========================================
-// MAIN LOOP
+// LOOP
 // ===========================================
 void loopMouse() {
+  handleLetterRecognition();
+  if (letterModeActive) return;
+
   float fx, fy, fz;
   getProcessedSensorData(fx, fy, fz);
-  
   handleMovementControl();
   handleMouseClicks();
   correctDrift();
-  
-  // Serial commands for tuning
+
   if (Serial.available()) {
     char cmd = Serial.read();
-    
-    if (cmd == 'x') {
-      x_sensitivity = Serial.parseFloat();
-      Serial.print("→ X sensitivity: "); Serial.println(x_sensitivity);
-    } else if (cmd == 'y') {
-      y_sensitivity = Serial.parseFloat();
-      Serial.print("→ Y sensitivity: "); Serial.println(y_sensitivity);
-    } else if (cmd == 'd') {
-      DEAD_ZONE = Serial.parseFloat();
-      Serial.print("→ Dead zone: "); Serial.println(DEAD_ZONE);
-    } else if (cmd == 'r') {
-      Serial.println("→ Recalibrating...");
-      offsetX = 0; offsetY = 0; offsetZ = 0;
-      for (int i = 0; i < 1000; i++) {
-        calcRotation();
-        offsetX += dpsX;
-        offsetY += dpsY;
-        offsetZ += dpsZ;
-        delay(2);
-      }
-      offsetX /= 1000; offsetY /= 1000; offsetZ /= 1000;
-      Serial.println("✓ Done!");
-    } else if (cmd == 's') {
-      Serial.println("\n═══ MOUSE SETTINGS ═══");
-      Serial.print("X Sensitivity: "); Serial.println(x_sensitivity);
-      Serial.print("Y Sensitivity: "); Serial.println(y_sensitivity);
-      Serial.print("Dead Zone: "); Serial.println(DEAD_ZONE);
-      Serial.print("Mode: "); Serial.println(movementEnabled ? "MOUSE" : "GESTURE");
-      Serial.println("═════════════════════\n");
+    if      (cmd=='x') { x_sensitivity=Serial.parseFloat(); Serial.print("X sens: "); Serial.println(x_sensitivity); }
+    else if (cmd=='y') { y_sensitivity=Serial.parseFloat(); Serial.print("Y sens: "); Serial.println(y_sensitivity); }
+    else if (cmd=='d') { DEAD_ZONE    =Serial.parseFloat(); Serial.print("Dead zone: "); Serial.println(DEAD_ZONE); }
+    else if (cmd=='r') {
+      offsetX=0; offsetY=0; offsetZ=0;
+      for(int i=0;i<1000;i++){calcRotation();offsetX+=dpsX;offsetY+=dpsY;offsetZ+=dpsZ;delay(2);}
+      offsetX/=1000; offsetY/=1000; offsetZ/=1000;
+      Serial.println("✓ Recalibrated.");
+    } else if (cmd=='s') {
+      Serial.printf("\nX=%.2f Y=%.2f DZ=%.2f Mode=%s\n", x_sensitivity, y_sensitivity, DEAD_ZONE, movementEnabled?"MOUSE":"GESTURE");
     }
-    
-    while (Serial.available()) Serial.read();
+    while(Serial.available()) Serial.read();
   }
-  
-  // Move mouse when enabled
+
   if (movementEnabled) {
-    int mx = -fz * x_sensitivity;
-    int my = fy * y_sensitivity;
-    mx = constrain(mx, -127, 127);
-    my = constrain(my, -127, 127);
+    int mx = constrain((int)(-fz * x_sensitivity), -127, 127);
+    int my = constrain((int)( fy * y_sensitivity), -127, 127);
     Mouse.move(mx, my, 0);
   }
-  
+
   delay(10);
 }
